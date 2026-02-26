@@ -1,0 +1,53 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_chatbot_api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001
+    env_file:
+      - .env
+    environment:
+      QDRANT_PATH: /app/data/qdrant
+      STORAGE_DIR: /app/data/storage
+    ports:
+      - "3082:8001"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - hf_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/documents', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_chatbot_ui
+    command: streamlit run ui/streamlit_app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true
+    env_file:
+      - .env
+    environment:
+      API_BASE_URL: http://api:8001
+    ports:
+      - "3081:8501"
+    volumes:
+      - ./config:/app/config
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    restart: unless-stopped
+
+volumes:
+  hf_cache:

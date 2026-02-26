@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenv
+.venv/
+venv/
+
+# Env and local config
+.env
+.env.*.local
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Runtime artifacts
+*.log
+
+# Generated indexes and caches
+data/qdrant/
+data/storage/
