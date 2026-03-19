@@ -4,16 +4,12 @@ from __future__ import annotations
 import html
 import os
 import sys
-from base64 import b64encode
 from pathlib import Path
 
 import httpx
 import streamlit as st
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-UI_ROOT = Path(__file__).resolve().parent
-LOGO_PNG_PATH = UI_ROOT / "assets" / "7RL_logo@8x.png"
-LOGO_SVG_PATH = UI_ROOT / "assets" / "7rlines_logo.svg"
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -151,21 +147,6 @@ def resolve_model_family(model_id: str) -> str:
     return "Custom"
 
 
-@st.cache_data(show_spinner=False)
-def load_logo_data_uri() -> str:
-    logo_path: Path | None = None
-    if LOGO_PNG_PATH.exists():
-        logo_path = LOGO_PNG_PATH
-    elif LOGO_SVG_PATH.exists():
-        logo_path = LOGO_SVG_PATH
-
-    if logo_path is None:
-        return ""
-    extension = logo_path.suffix.lower()
-    mime_type = "image/svg+xml" if extension == ".svg" else "image/png"
-    return f"data:{mime_type};base64,{b64encode(logo_path.read_bytes()).decode('ascii')}"
-
-
 def inject_styles() -> None:
     st.markdown(
         """
@@ -255,19 +236,7 @@ def inject_styles() -> None:
             }
 
             .hero-top {
-                display: grid;
-                grid-template-columns: minmax(170px, 220px) minmax(0, 1fr);
-                align-items: start;
-                column-gap: 1rem;
-                min-width: 0;
-            }
-
-            .hero-logo {
-                width: 100%;
-                max-width: 220px;
-                height: auto;
                 display: block;
-                flex-shrink: 0;
             }
 
             .hero-kicker {
@@ -411,26 +380,6 @@ def inject_styles() -> None:
                     padding-left: 0.85rem;
                     padding-right: 0.85rem;
                 }
-
-                .hero-top {
-                    grid-template-columns: minmax(150px, 190px) minmax(0, 1fr);
-                    column-gap: 0.8rem;
-                }
-
-                .hero-logo {
-                    max-width: 190px;
-                }
-            }
-
-            @media (max-width: 640px) {
-                .hero-top {
-                    grid-template-columns: 1fr;
-                    row-gap: 0.6rem;
-                }
-
-                .hero-logo {
-                    max-width: 165px;
-                }
             }
         </style>
         """,
@@ -440,7 +389,6 @@ def inject_styles() -> None:
 
 def render_hero() -> None:
     settings = get_settings()
-    logo_data_uri = load_logo_data_uri()
     model_family = resolve_model_family(settings.groq_model)
     rules_state = "ON" if bool(getattr(settings, "domain_rules_enabled", False)) else "OFF"
 
@@ -451,9 +399,6 @@ def render_hero() -> None:
     except Exception:
         pass
 
-    logo_html = ""
-    if logo_data_uri:
-        logo_html = f'<img src="{logo_data_uri}" alt="7R logo" class="hero-logo" />'
     safe_family = html.escape(model_family)
     safe_model = html.escape(settings.groq_model)
 
@@ -461,7 +406,6 @@ def render_hero() -> None:
         f"""
         <section class="hero-shell">
             <div class="hero-top">
-                {logo_html}
                 <div>
                     <div class="hero-kicker">Universal RAG</div>
                     <div class="hero-title">RAG Demo Console</div>
