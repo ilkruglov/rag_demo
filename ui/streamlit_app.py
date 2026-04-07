@@ -15,10 +15,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import (  # noqa: E402
+    DEFAULT_PROFILE_ID,
     DEFAULT_STOP_SEQUENCES,
+    delete_profile,
+    get_profile_catalog,
     get_prompt_presets,
     get_settings,
     reload_settings,
+    save_profile,
     save_runtime_settings,
 )
 
@@ -47,6 +51,7 @@ PROMPT_PRESET_LABELS = {
     "universal": "Универсальный (рекомендуется)",
     "concise": "Краткий",
     "strict_citations": "Строгие ссылки на источники",
+    "nrd_depository_support": "НРД депозитарная поддержка",
 }
 
 
@@ -54,7 +59,10 @@ def answer_via_api(question: str) -> dict:
     with httpx.Client(timeout=120.0) as client:
         response = client.post(
             f"{API_BASE_URL}/chat",
-            json={"question": question},
+            json={
+                "question": question,
+                "profile_id": get_selected_profile_id(),
+            },
         )
         response.raise_for_status()
         return response.json()
@@ -62,7 +70,10 @@ def answer_via_api(question: str) -> dict:
 
 def list_documents_via_api() -> dict:
     with httpx.Client(timeout=20.0) as client:
-        response = client.get(f"{API_BASE_URL}/documents")
+        response = client.get(
+            f"{API_BASE_URL}/documents",
+            params={"profile_id": get_selected_profile_id()},
+        )
         response.raise_for_status()
         return response.json()
 
@@ -82,7 +93,11 @@ def upload_documents_via_api(uploaded_files: list) -> dict:
         )
 
     with httpx.Client(timeout=600.0) as client:
-        response = client.post(f"{API_BASE_URL}/documents", files=files)
+        response = client.post(
+            f"{API_BASE_URL}/documents",
+            params={"profile_id": get_selected_profile_id()},
+            files=files,
+        )
         response.raise_for_status()
         return response.json()
 
@@ -91,10 +106,42 @@ def delete_documents_via_api(file_names: list[str]) -> dict:
     with httpx.Client(timeout=600.0) as client:
         response = client.post(
             f"{API_BASE_URL}/documents/delete",
-            json={"file_names": file_names},
+            json={
+                "file_names": file_names,
+                "profile_id": get_selected_profile_id(),
+            },
         )
         response.raise_for_status()
         return response.json()
+
+
+def get_profiles_catalog() -> dict[str, dict]:
+    return get_profile_catalog()
+
+
+def ensure_profile_state() -> None:
+    catalog = get_profiles_catalog()
+    if "selected_profile_id" not in st.session_state or st.session_state.selected_profile_id not in catalog:
+        st.session_state.selected_profile_id = get_settings().active_profile
+    if "history_by_profile" not in st.session_state:
+        st.session_state.history_by_profile = {}
+
+
+def get_selected_profile_id() -> str:
+    ensure_profile_state()
+    return st.session_state.selected_profile_id
+
+
+def get_selected_profile_settings():
+    return get_settings(get_selected_profile_id())
+
+
+def get_profile_history(profile_id: str) -> list[dict]:
+    ensure_profile_state()
+    history_by_profile = st.session_state.history_by_profile
+    if profile_id not in history_by_profile:
+        history_by_profile[profile_id] = []
+    return history_by_profile[profile_id]
 
 
 def fetch_groq_models(api_key: str) -> dict[str, str]:
@@ -388,7 +435,10 @@ def inject_styles() -> None:
 
 
 def render_hero() -> None:
-    settings = get_settings()
+    profile_id = get_selected_profile_id()
+    profile_catalog = get_profiles_catalog()
+    profile_entry = profile_catalog[profile_id]
+    settings = get_settings(profile_id)
     model_family = resolve_model_family(settings.groq_model)
     rules_state = "ON" if bool(getattr(settings, "domain_rules_enabled", False)) else "OFF"
 
@@ -401,6 +451,7 @@ def render_hero() -> None:
 
     safe_family = html.escape(model_family)
     safe_model = html.escape(settings.groq_model)
+    safe_profile = html.escape(profile_entry["label"])
 
     st.markdown(
         f"""
@@ -415,6 +466,7 @@ def render_hero() -> None:
                 </div>
             </div>
             <div class="hero-meta">
+                <span class="hero-pill"><b>Profile:</b> {safe_profile}</span>
                 <span class="hero-pill"><b>Family:</b> {safe_family}</span>
                 <span class="hero-pill"><b>Model:</b> {safe_model}</span>
                 <span class="hero-pill"><b>Docs:</b> {docs_total}</span>
@@ -429,7 +481,22 @@ def render_hero() -> None:
 
 
 def render_sidebar() -> None:
-    settings = get_settings()
+    ensure_profile_state()
+    catalog = get_profiles_catalog()
+    current_profile = get_selected_profile_id()
+
+    selected_profile = st.sidebar.selectbox(
+        "Профиль задачи",
+        options=list(catalog.keys()),
+        index=list(catalog.keys()).index(current_profile),
+        format_func=lambda item: catalog[item]["label"],
+    )
+    if selected_profile != current_profile:
+        st.session_state.selected_profile_id = selected_profile
+        save_runtime_settings({"active_profile": selected_profile})
+        st.rerun()
+
+    settings = get_settings(selected_profile)
     st.sidebar.markdown(
         """
         <div class="sidebar-brand">
@@ -440,6 +507,7 @@ def render_sidebar() -> None:
         unsafe_allow_html=True,
     )
 
+    st.sidebar.write(f"**Профиль:** `{catalog[selected_profile]['label']}`")
     st.sidebar.metric("Top-K документов", int(settings.retrieval_top_k))
     st.sidebar.metric("Max tokens", int(settings.max_output_tokens))
     st.sidebar.write(f"**Модель:** `{settings.groq_model}`")
@@ -457,7 +525,10 @@ def render_sidebar() -> None:
 
 
 def render_documents() -> None:
+    profile_id = get_selected_profile_id()
+    profile_entry = get_profiles_catalog()[profile_id]
     st.subheader("Документы")
+    st.caption(f"Активный профиль: `{profile_entry['label']}`")
     st.caption("Загрузка или удаление автоматически запускает переиндексацию.")
 
     with st.container(border=True):
@@ -538,9 +609,11 @@ def render_documents() -> None:
 
 
 def render_chat() -> None:
+    profile_id = get_selected_profile_id()
+    profile_entry = get_profiles_catalog()[profile_id]
     st.subheader("Чат")
-    if "history" not in st.session_state:
-        st.session_state.history = []
+    st.caption(f"Профиль поиска: `{profile_entry['label']}`")
+    history = get_profile_history(profile_id)
 
     with st.form("chat-form", clear_on_submit=True):
         question = st.text_area("Ваш вопрос", height=120)
@@ -560,7 +633,7 @@ def render_chat() -> None:
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"Не удалось получить ответ: {exc}")
                 else:
-                    st.session_state.history.append(
+                    history.append(
                         {
                             "question": question,
                             "answer": result.get("answer", ""),
@@ -568,8 +641,8 @@ def render_chat() -> None:
                         }
                     )
 
-    if st.session_state.history:
-        for idx, item in enumerate(reversed(st.session_state.history), start=1):
+    if history:
+        for idx, item in enumerate(reversed(history), start=1):
             with st.container(border=True):
                 st.markdown(f"**Запрос {idx}:** {item['question']}")
                 st.markdown(item["answer"])
@@ -592,8 +665,56 @@ def render_chat() -> None:
 
 
 def render_settings() -> None:
-    st.subheader("Настройки модели и промпта")
-    settings = get_settings()
+    profile_id = get_selected_profile_id()
+    profile_catalog = get_profiles_catalog()
+    profile_entry = profile_catalog[profile_id]
+    settings = get_settings(profile_id)
+
+    st.subheader("Профили и настройки")
+    st.caption("Один движок, несколько задач: у каждого профиля своя база знаний, коллекция и системный промпт.")
+
+    with st.container(border=True):
+        st.markdown(f"**Текущий профиль:** `{profile_entry['label']}`")
+        if profile_entry.get("description"):
+            st.caption(profile_entry["description"])
+        st.write(f"**Raw:** `{profile_entry['raw_documents_dir']}`")
+        st.write(f"**Qdrant:** `{profile_entry['qdrant_path']}`")
+        st.write(f"**Storage:** `{profile_entry['storage_dir']}`")
+        st.write(f"**Collection:** `{profile_entry['qdrant_collection']}`")
+
+    with st.form("profile-create-form", clear_on_submit=True):
+        st.markdown("**Создать новый профиль**")
+        new_profile_id = st.text_input("ID профиля", placeholder="support-faq")
+        new_profile_label = st.text_input("Название профиля", placeholder="Поддержка / FAQ")
+        new_profile_description = st.text_input("Описание", placeholder="Для какой задачи этот профиль")
+        create_profile_submitted = st.form_submit_button("Создать профиль")
+
+    if create_profile_submitted:
+        if not new_profile_id.strip():
+            st.error("Укажите ID профиля.")
+        else:
+            save_profile(
+                new_profile_id,
+                {
+                    "label": new_profile_label.strip() or None,
+                    "description": new_profile_description.strip(),
+                },
+                activate=True,
+            )
+            st.session_state.selected_profile_id = get_settings().active_profile
+            st.success("Профиль создан.")
+            st.rerun()
+
+    if profile_id != DEFAULT_PROFILE_ID:
+        with st.container(border=True):
+            st.caption("Удаление профиля убирает его из конфигурации, но не удаляет документы и индексы с диска.")
+            if st.button("Удалить текущий профиль"):
+                delete_profile(profile_id)
+                st.session_state.selected_profile_id = DEFAULT_PROFILE_ID
+                st.success("Профиль удалён из конфигурации.")
+                st.rerun()
+
+    st.markdown("### Параметры LLM и retrieval")
 
     available_models = fetch_groq_models(settings.groq_api_key)
     model_to_label: dict[str, str] = {}
@@ -670,6 +791,24 @@ def render_settings() -> None:
             value=bool(getattr(settings, "domain_rules_enabled", False)),
         )
 
+        with st.expander("Хранилище профиля", expanded=profile_id != DEFAULT_PROFILE_ID):
+            raw_documents_dir = st.text_input(
+                "Каталог raw документов",
+                value=str(profile_entry["raw_documents_dir"]),
+            )
+            qdrant_path = st.text_input(
+                "Путь Qdrant",
+                value=str(profile_entry["qdrant_path"]),
+            )
+            storage_dir = st.text_input(
+                "Путь storage",
+                value=str(profile_entry["storage_dir"]),
+            )
+            qdrant_collection = st.text_input(
+                "Коллекция Qdrant",
+                value=str(profile_entry["qdrant_collection"]),
+            )
+
         submitted = st.form_submit_button("Сохранить настройки")
 
     if submitted:
@@ -687,6 +826,10 @@ def render_settings() -> None:
             "system_prompt": final_prompt,
             "stop_sequences": cleaned_stops or DEFAULT_STOP_SEQUENCES,
             "domain_rules_enabled": bool(domain_rules_enabled),
+            "raw_documents_dir": raw_documents_dir.strip(),
+            "qdrant_path": qdrant_path.strip(),
+            "storage_dir": storage_dir.strip(),
+            "qdrant_collection": qdrant_collection.strip(),
         }
         if selected_reranker == "none":
             update["reranker_model"] = "none"
@@ -694,13 +837,14 @@ def render_settings() -> None:
         else:
             update["reranker_model"] = selected_reranker
             update["reranker_top_n"] = int(reranker_top_n)
-        save_runtime_settings(update)
+        save_runtime_settings(update, profile_id=profile_id)
         st.success("Настройки сохранены.")
         st.rerun()
 
 
 def main() -> None:
     st.set_page_config(page_title="Universal RAG Demo", layout="wide")
+    ensure_profile_state()
     inject_styles()
     render_sidebar()
     render_hero()

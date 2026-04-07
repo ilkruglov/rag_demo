@@ -25,3 +25,5 @@ venv/
 # Generated indexes and caches
 data/qdrant/
 data/storage/
+data/profiles/*/qdrant/
+data/profiles/*/storage/

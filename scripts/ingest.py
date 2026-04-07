@@ -523,8 +523,8 @@ def build_nodes(
     return nodes
 
 
-def persist_vector_store(nodes):
-    settings = get_settings()
+def persist_vector_store(nodes, profile_id: str | None = None):
+    settings = get_settings(profile_id)
     start_time = time.time()
 
     if settings.force_offline_mode:
@@ -617,10 +617,10 @@ def _clear_directory_contents(path: Path) -> None:
             shutil.rmtree(child)
 
 
-def clear_indexes() -> None:
+def clear_indexes(profile_id: str | None = None) -> None:
     """Remove vector and keyword indexes from local storage."""
 
-    settings = get_settings()
+    settings = get_settings(profile_id)
     qdrant_path = Path(settings.qdrant_path)
     qdrant_path.mkdir(parents=True, exist_ok=True)
     client = _get_qdrant_client(str(qdrant_path))
@@ -634,8 +634,8 @@ def clear_indexes() -> None:
     clear_bm25_cache()
 
 
-def ingest(source: Path | Iterable[Path] | None = None):
-    settings = get_settings()
+def ingest(source: Path | Iterable[Path] | None = None, profile_id: str | None = None):
+    settings = get_settings(profile_id)
     raw_dir = get_raw_documents_dir(settings)
 
     if source is None:
@@ -662,19 +662,20 @@ def ingest(source: Path | Iterable[Path] | None = None):
         chunk_overlap=chunk_overlap,
         domain_rules_enabled=settings.domain_rules_enabled,
     )
-    persist_vector_store(nodes)
+    persist_vector_store(nodes, profile_id=profile_id)
 
 
-def main(raw_dir: Path | None = None):
+def main(raw_dir: Path | None = None, profile_id: str | None = None):
     if raw_dir is not None and not raw_dir.exists():
         msg = f"Source directory not found: {raw_dir}"
         raise FileNotFoundError(msg)
 
-    ingest(raw_dir)
+    ingest(raw_dir, profile_id=profile_id)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest documents into the vector store")
     parser.add_argument("--source", type=Path, default=None, help="Directory with raw documents")
+    parser.add_argument("--profile", type=str, default=None, help="Task profile identifier")
     args = parser.parse_args()
-    main(args.source)
+    main(args.source, profile_id=args.profile)

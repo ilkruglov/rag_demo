@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 class ChatRequest(BaseModel):
     question: str
+    profile_id: str | None = None
 
 
 class Source(BaseModel):
@@ -23,12 +24,14 @@ class Source(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     sources: list[Source] = Field(default_factory=list)
+    profile_id: str | None = None
 
 
 class DocumentUploadResponse(BaseModel):
     saved_files: list[str]
     ingestion_started: bool
     total_documents: int | None = None
+    profile_id: str | None = None
 
 
 class DocumentInfo(BaseModel):
@@ -40,10 +43,12 @@ class DocumentInfo(BaseModel):
 class DocumentListResponse(BaseModel):
     documents: list[DocumentInfo] = Field(default_factory=list)
     total_documents: int = 0
+    profile_id: str | None = None
 
 
 class DocumentDeleteRequest(BaseModel):
     file_names: list[str] = Field(default_factory=list)
+    profile_id: str | None = None
 
 
 class DocumentDeleteResponse(BaseModel):
@@ -51,3 +56,21 @@ class DocumentDeleteResponse(BaseModel):
     reindexed: bool
     indexes_cleared: bool
     total_documents: int
+    profile_id: str | None = None
+
+
+class ProfileInfo(BaseModel):
+    profile_id: str
+    label: str
+    description: str = ""
+    is_active: bool = False
+    qdrant_path: str
+    storage_dir: str
+    raw_documents_dir: str
+    qdrant_collection: str
+    total_documents: int = 0
+
+
+class ProfileListResponse(BaseModel):
+    active_profile: str
+    profiles: list[ProfileInfo] = Field(default_factory=list)

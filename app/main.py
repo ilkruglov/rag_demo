@@ -1,17 +1,18 @@
-"""FastAPI entrypoint exposing chatbot and document management endpoints."""
+"""FastAPI entrypoint exposing chatbot, profiles, and document management endpoints."""
 import asyncio
 import logging
 import re
 import shutil
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, List
 
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import get_raw_documents_dir, get_settings
+from app.config import get_profile_catalog, get_raw_documents_dir, get_settings, normalize_profile_id
 from app.models.schemas import (
     ChatRequest,
     ChatResponse,
@@ -20,16 +21,16 @@ from app.models.schemas import (
     DocumentInfo,
     DocumentListResponse,
     DocumentUploadResponse,
+    ProfileInfo,
+    ProfileListResponse,
 )
 from app.services.chat import answer, refresh_query_engine_cache
 from scripts.ingest import SUPPORTED_EXTENSIONS, clear_indexes, ingest
 
-# Configure logging for app modules
 logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s:%(name)s:%(message)s",
 )
-# Set specific module loggers to INFO
 logging.getLogger("app.services.chat").setLevel(logging.INFO)
 logging.getLogger("app.services.bm25_retriever").setLevel(logging.INFO)
 
@@ -44,29 +45,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_settings = get_settings()
-_RAW_DATA_DIR = get_raw_documents_dir(_settings)
-_RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-_INGESTION_LOCK: asyncio.Lock | None = None
-_STATE_CONDITION: asyncio.Condition | None = None
-_ACTIVE_CHAT_REQUESTS = 0
-_INGESTION_IN_PROGRESS = False
+_PROFILE_INGESTION_LOCKS: dict[str, asyncio.Lock] = {}
+_PROFILE_STATE_CONDITIONS: dict[str, asyncio.Condition] = {}
+_ACTIVE_CHAT_REQUESTS: dict[str, int] = {}
+_INGESTION_IN_PROGRESS: dict[str, bool] = {}
 _DOCUMENT_OP_LOCK_TIMEOUT_SECONDS = 600.0
 
 
-def _get_ingestion_lock() -> asyncio.Lock:
-    global _INGESTION_LOCK
-    if _INGESTION_LOCK is None:
-        _INGESTION_LOCK = asyncio.Lock()
-    return _INGESTION_LOCK
+def _resolve_profile(profile_id: str | None) -> tuple[str, Path]:
+    try:
+        settings = get_settings(profile_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown profile: {normalize_profile_id(profile_id)}",
+        ) from exc
+
+    raw_dir = get_raw_documents_dir(settings)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    return settings.active_profile, raw_dir
 
 
-def _get_state_condition() -> asyncio.Condition:
-    global _STATE_CONDITION
-    if _STATE_CONDITION is None:
-        _STATE_CONDITION = asyncio.Condition()
-    return _STATE_CONDITION
+def _get_ingestion_lock(profile_id: str) -> asyncio.Lock:
+    lock = _PROFILE_INGESTION_LOCKS.get(profile_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PROFILE_INGESTION_LOCKS[profile_id] = lock
+    return lock
+
+
+def _get_state_condition(profile_id: str) -> asyncio.Condition:
+    condition = _PROFILE_STATE_CONDITIONS.get(profile_id)
+    if condition is None:
+        condition = asyncio.Condition()
+        _PROFILE_STATE_CONDITIONS[profile_id] = condition
+    return condition
 
 
 def _sanitize_filename(filename: str) -> str:
@@ -75,31 +88,31 @@ def _sanitize_filename(filename: str) -> str:
     return sanitized or "uploaded_file"
 
 
-def _next_available_path(sanitized_name: str) -> Path:
+def _next_available_path(raw_dir: Path, sanitized_name: str) -> Path:
     base = Path(sanitized_name).stem or "uploaded_file"
     suffix = Path(sanitized_name).suffix
-    candidate = _RAW_DATA_DIR / f"{base}{suffix}"
+    candidate = raw_dir / f"{base}{suffix}"
     index = 1
     while candidate.exists():
-        candidate = _RAW_DATA_DIR / f"{base}-{index}{suffix}"
+        candidate = raw_dir / f"{base}-{index}{suffix}"
         index += 1
     return candidate
 
 
-def _save_upload(file: UploadFile) -> Path:
+def _save_upload(raw_dir: Path, file: UploadFile) -> Path:
     sanitized_name = _sanitize_filename(file.filename or "document")
-    destination = _next_available_path(sanitized_name)
+    destination = _next_available_path(raw_dir, sanitized_name)
     file.file.seek(0)
     with destination.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     return destination
 
 
-def _list_supported_documents() -> list[Path]:
+def _list_supported_documents(raw_dir: Path) -> list[Path]:
     return sorted(
         [
             path
-            for path in _RAW_DATA_DIR.glob("*")
+            for path in raw_dir.glob("*")
             if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
         ],
         key=lambda path: path.name.lower(),
@@ -115,52 +128,85 @@ def _build_document_info(path: Path) -> DocumentInfo:
     )
 
 
-async def _wait_for_ingestion_slot(condition: asyncio.Condition) -> None:
-    global _INGESTION_IN_PROGRESS, _ACTIVE_CHAT_REQUESTS
+async def _wait_for_ingestion_slot(profile_id: str, condition: asyncio.Condition) -> None:
     async with condition:
-        while _ACTIVE_CHAT_REQUESTS > 0 or _INGESTION_IN_PROGRESS:
+        while _ACTIVE_CHAT_REQUESTS.get(profile_id, 0) > 0 or _INGESTION_IN_PROGRESS.get(profile_id, False):
             await condition.wait()
-        _INGESTION_IN_PROGRESS = True
+        _INGESTION_IN_PROGRESS[profile_id] = True
 
 
-async def _finish_ingestion_slot(condition: asyncio.Condition) -> None:
-    global _INGESTION_IN_PROGRESS
+async def _finish_ingestion_slot(profile_id: str, condition: asyncio.Condition) -> None:
     async with condition:
-        _INGESTION_IN_PROGRESS = False
+        _INGESTION_IN_PROGRESS[profile_id] = False
         condition.notify_all()
 
 
 async def _acquire_document_operation_lock(lock: asyncio.Lock) -> None:
-    """Wait for an exclusive documents operation slot."""
-
     await asyncio.wait_for(lock.acquire(), timeout=_DOCUMENT_OP_LOCK_TIMEOUT_SECONDS)
 
 
-def _reindex_or_clear_documents() -> tuple[bool, bool]:
-    if _list_supported_documents():
-        ingest()
+def _reindex_or_clear_documents(profile_id: str, raw_dir: Path) -> tuple[bool, bool]:
+    if _list_supported_documents(raw_dir):
+        ingest(source=raw_dir, profile_id=profile_id)
         refresh_query_engine_cache()
         return True, False
 
-    clear_indexes()
+    clear_indexes(profile_id=profile_id)
     refresh_query_engine_cache()
     return False, True
 
 
-@app.get("/documents", response_model=DocumentListResponse)
-async def list_documents() -> DocumentListResponse:
-    """List documents currently included in the knowledge base."""
+@app.get("/profiles", response_model=ProfileListResponse)
+async def list_profiles() -> ProfileListResponse:
+    """Return available task profiles and their document counts."""
 
-    docs = _list_supported_documents()
+    catalog = get_profile_catalog()
+    profiles: list[ProfileInfo] = []
+    for entry in catalog.values():
+        raw_dir = Path(entry["raw_documents_dir"])
+        total_documents = len(_list_supported_documents(raw_dir)) if raw_dir.exists() else 0
+        profiles.append(
+            ProfileInfo(
+                profile_id=entry["profile_id"],
+                label=entry["label"],
+                description=entry["description"],
+                is_active=entry["is_active"],
+                qdrant_path=entry["qdrant_path"],
+                storage_dir=entry["storage_dir"],
+                raw_documents_dir=entry["raw_documents_dir"],
+                qdrant_collection=entry["qdrant_collection"],
+                total_documents=total_documents,
+            )
+        )
+
+    profiles.sort(key=lambda item: (not item.is_active, item.label.lower()))
+    return ProfileListResponse(
+        active_profile=get_settings().active_profile,
+        profiles=profiles,
+    )
+
+
+@app.get("/documents", response_model=DocumentListResponse)
+async def list_documents(profile_id: str | None = Query(default=None)) -> DocumentListResponse:
+    """List documents currently included in the selected knowledge base."""
+
+    resolved_profile, raw_dir = _resolve_profile(profile_id)
+    docs = _list_supported_documents(raw_dir)
     return DocumentListResponse(
         documents=[_build_document_info(path) for path in docs],
         total_documents=len(docs),
+        profile_id=resolved_profile,
     )
 
 
 @app.post("/documents", response_model=DocumentUploadResponse, status_code=status.HTTP_201_CREATED)
-async def upload_documents(files: List[UploadFile] = File(...)) -> DocumentUploadResponse:
-    """Upload documents and rebuild the vector index."""
+async def upload_documents(
+    profile_id: str | None = Query(default=None),
+    files: List[UploadFile] = File(...),
+) -> DocumentUploadResponse:
+    """Upload documents and rebuild the selected vector index."""
+
+    resolved_profile, raw_dir = _resolve_profile(profile_id)
 
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
@@ -170,28 +216,28 @@ async def upload_documents(files: List[UploadFile] = File(...)) -> DocumentUploa
         if extension not in SUPPORTED_EXTENSIONS:
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {extension or 'unknown'}")
 
-    lock = _get_ingestion_lock()
-    condition = _get_state_condition()
+    lock = _get_ingestion_lock(resolved_profile)
+    condition = _get_state_condition(resolved_profile)
     saved_files: list[str] = []
     lock_acquired = False
     try:
         await _acquire_document_operation_lock(lock)
         lock_acquired = True
-    
+
         for upload in files:
-            path = _save_upload(upload)
+            path = _save_upload(raw_dir, upload)
             saved_files.append(path.name)
 
-        await _wait_for_ingestion_slot(condition)
+        await _wait_for_ingestion_slot(resolved_profile, condition)
         try:
-            await run_in_threadpool(_reindex_or_clear_documents)
+            await run_in_threadpool(partial(_reindex_or_clear_documents, resolved_profile, raw_dir))
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - defensive logging
-            LOGGER.exception("Document ingestion failed: %s", exc)
+            LOGGER.exception("Document ingestion failed for profile %s: %s", resolved_profile, exc)
             raise HTTPException(status_code=500, detail="Document ingestion failed") from exc
         finally:
-            await _finish_ingestion_slot(condition)
+            await _finish_ingestion_slot(resolved_profile, condition)
     except asyncio.TimeoutError:
         raise HTTPException(
             status_code=409,
@@ -204,20 +250,26 @@ async def upload_documents(files: List[UploadFile] = File(...)) -> DocumentUploa
     return DocumentUploadResponse(
         saved_files=saved_files,
         ingestion_started=True,
-        total_documents=len(_list_supported_documents()),
+        total_documents=len(_list_supported_documents(raw_dir)),
+        profile_id=resolved_profile,
     )
 
 
 @app.post("/documents/add", response_model=DocumentUploadResponse, status_code=status.HTTP_201_CREATED)
-async def add_documents(files: List[UploadFile] = File(...)) -> DocumentUploadResponse:
+async def add_documents(
+    profile_id: str | None = Query(default=None),
+    files: List[UploadFile] = File(...),
+) -> DocumentUploadResponse:
     """Alias for /documents to simplify demo integrations."""
 
-    return await upload_documents(files=files)
+    return await upload_documents(profile_id=profile_id, files=files)
 
 
 @app.post("/documents/delete", response_model=DocumentDeleteResponse)
 async def delete_documents(payload: DocumentDeleteRequest) -> DocumentDeleteResponse:
-    """Delete documents from KB and rebuild (or clear) vector index."""
+    """Delete documents from a profile KB and rebuild or clear its index."""
+
+    resolved_profile, raw_dir = _resolve_profile(payload.profile_id)
 
     if not payload.file_names:
         raise HTTPException(status_code=400, detail="No files provided")
@@ -232,12 +284,12 @@ async def delete_documents(payload: DocumentDeleteRequest) -> DocumentDeleteResp
         sanitized_names.append(clean_name)
 
     requested = sorted(set(sanitized_names))
-    missing = [name for name in requested if not (_RAW_DATA_DIR / name).exists()]
+    missing = [name for name in requested if not (raw_dir / name).exists()]
     if missing:
         raise HTTPException(status_code=404, detail=f"Files not found: {', '.join(missing)}")
 
-    lock = _get_ingestion_lock()
-    condition = _get_state_condition()
+    lock = _get_ingestion_lock(resolved_profile)
+    condition = _get_state_condition(resolved_profile)
     lock_acquired = False
 
     try:
@@ -245,16 +297,18 @@ async def delete_documents(payload: DocumentDeleteRequest) -> DocumentDeleteResp
         lock_acquired = True
 
         for file_name in requested:
-            (_RAW_DATA_DIR / file_name).unlink(missing_ok=False)
+            (raw_dir / file_name).unlink(missing_ok=False)
 
-        await _wait_for_ingestion_slot(condition)
+        await _wait_for_ingestion_slot(resolved_profile, condition)
         try:
-            reindexed, indexes_cleared = await run_in_threadpool(_reindex_or_clear_documents)
+            reindexed, indexes_cleared = await run_in_threadpool(
+                partial(_reindex_or_clear_documents, resolved_profile, raw_dir)
+            )
         except Exception as exc:  # pragma: no cover - defensive logging
-            LOGGER.exception("Document deletion reindex failed: %s", exc)
+            LOGGER.exception("Document deletion reindex failed for profile %s: %s", resolved_profile, exc)
             raise HTTPException(status_code=500, detail="Document deletion failed") from exc
         finally:
-            await _finish_ingestion_slot(condition)
+            await _finish_ingestion_slot(resolved_profile, condition)
     except asyncio.TimeoutError:
         raise HTTPException(
             status_code=409,
@@ -268,31 +322,39 @@ async def delete_documents(payload: DocumentDeleteRequest) -> DocumentDeleteResp
         deleted_files=requested,
         reindexed=reindexed,
         indexes_cleared=indexes_cleared,
-        total_documents=len(_list_supported_documents()),
+        total_documents=len(_list_supported_documents(raw_dir)),
+        profile_id=resolved_profile,
     )
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(payload: ChatRequest) -> ChatResponse:
-    """Chat endpoint that runs the RAG pipeline."""
+    """Run the RAG pipeline for the selected profile."""
 
-    condition = _get_state_condition()
-    global _ACTIVE_CHAT_REQUESTS
+    resolved_profile, _ = _resolve_profile(payload.profile_id)
+    condition = _get_state_condition(resolved_profile)
 
     async with condition:
-        if _INGESTION_IN_PROGRESS:
+        if _INGESTION_IN_PROGRESS.get(resolved_profile, False):
             raise HTTPException(status_code=503, detail="Document ingestion in progress")
-        _ACTIVE_CHAT_REQUESTS += 1
+        _ACTIVE_CHAT_REQUESTS[resolved_profile] = _ACTIVE_CHAT_REQUESTS.get(resolved_profile, 0) + 1
 
     result: dict[str, Any] = {}
     try:
-        result = await run_in_threadpool(answer, payload.question)
+        result = await run_in_threadpool(answer, payload.question, resolved_profile)
     except FileNotFoundError as error:
         raise HTTPException(status_code=503, detail="Vector store is not initialized") from error
     finally:
         async with condition:
-            _ACTIVE_CHAT_REQUESTS -= 1
-            if _ACTIVE_CHAT_REQUESTS == 0:
+            _ACTIVE_CHAT_REQUESTS[resolved_profile] = max(
+                0,
+                _ACTIVE_CHAT_REQUESTS.get(resolved_profile, 1) - 1,
+            )
+            if _ACTIVE_CHAT_REQUESTS[resolved_profile] == 0:
                 condition.notify_all()
 
-    return ChatResponse(answer=result["answer"], sources=result["sources"])
+    return ChatResponse(
+        answer=result["answer"],
+        sources=result["sources"],
+        profile_id=resolved_profile,
+    )

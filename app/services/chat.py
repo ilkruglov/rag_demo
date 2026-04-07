@@ -56,10 +56,8 @@ class MetadataStripper(BaseNodePostprocessor):
 LOGGER = logging.getLogger(__name__)
 
 
-_QDRANT_CLIENT: QdrantClient | None = None
-_QDRANT_CLIENT_PATH: str | None = None
-_QDRANT_ASYNC_CLIENT: Any | None = None
-_QDRANT_ASYNC_CLIENT_PATH: str | None = None
+_QDRANT_CLIENTS: dict[str, QdrantClient] = {}
+_QDRANT_ASYNC_CLIENTS: dict[str, Any] = {}
 
 
 def _strip_internal_thoughts(text: str) -> str:
@@ -110,9 +108,10 @@ def _build_excerpt(text: str, limit: int = 280) -> str | None:
     return f"{trimmed}…"
 
 
-def _settings_signature() -> str:
-    settings = get_settings()
+def _settings_signature(profile_id: str | None = None) -> str:
+    settings = get_settings(profile_id)
     fingerprint = {
+        "active_profile": settings.active_profile,
         "groq_model": settings.groq_model,
         "temperature": settings.temperature,
         "top_p": settings.top_p,
@@ -131,9 +130,9 @@ def _settings_signature() -> str:
     return json.dumps(fingerprint, sort_keys=True)
 
 
-@lru_cache(maxsize=1)
-def _build_query_engine(signature: str):  # noqa: ARG001
-    settings = get_settings()
+@lru_cache(maxsize=8)
+def _build_query_engine(signature: str, profile_id: str):  # noqa: ARG001
+    settings = get_settings(profile_id)
 
     if settings.force_offline_mode:
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -278,10 +277,14 @@ def _get_reranker(model_name: str, top_n: int):
         return KeywordOverlapReranker(top_n=top_n)
 
 
-def answer(question: str) -> dict[str, Any]:
-    signature = _settings_signature()
-    query_engine = _build_query_engine(signature)
-    settings = get_settings()
+def answer(question: str, profile_id: str | None = None) -> dict[str, Any]:
+    return answer_for_profile(question, profile_id=profile_id)
+
+
+def answer_for_profile(question: str, profile_id: str | None = None) -> dict[str, Any]:
+    settings = get_settings(profile_id)
+    signature = _settings_signature(settings.active_profile)
+    query_engine = _build_query_engine(signature, settings.active_profile)
 
     expanded_question = question
     if settings.domain_rules_enabled:
@@ -351,29 +354,17 @@ class _AsyncQdrantProxy:
 
 
 def _get_qdrant_client(path: str) -> QdrantClient:
-    global _QDRANT_CLIENT, _QDRANT_CLIENT_PATH
-
-    if _QDRANT_CLIENT is not None and _QDRANT_CLIENT_PATH == path:
-        return _QDRANT_CLIENT
-
-    if _QDRANT_CLIENT is not None:
-        close_fn = getattr(_QDRANT_CLIENT, "close", None)
-        if callable(close_fn):
-            try:
-                close_fn()
-            except Exception:  # noqa: BLE001
-                pass
-
-    _QDRANT_CLIENT = QdrantClient(path=path)
-    _QDRANT_CLIENT_PATH = path
-    return _QDRANT_CLIENT
+    client = _QDRANT_CLIENTS.get(path)
+    if client is None:
+        client = QdrantClient(path=path)
+        _QDRANT_CLIENTS[path] = client
+    return client
 
 
 def _get_qdrant_async_client(path: str) -> Any:
-    global _QDRANT_ASYNC_CLIENT, _QDRANT_ASYNC_CLIENT_PATH
-
-    if _QDRANT_ASYNC_CLIENT is not None and _QDRANT_ASYNC_CLIENT_PATH == path:
-        return _QDRANT_ASYNC_CLIENT
+    async_client = _QDRANT_ASYNC_CLIENTS.get(path)
+    if async_client is not None:
+        return async_client
 
     client = _get_qdrant_client(path)
 
@@ -383,6 +374,5 @@ def _get_qdrant_async_client(path: str) -> Any:
         LOGGER.debug("Falling back to threaded async proxy for Qdrant at %s: %s", path, exc)
         async_client = _AsyncQdrantProxy(client)
 
-    _QDRANT_ASYNC_CLIENT = async_client
-    _QDRANT_ASYNC_CLIENT_PATH = path
-    return _QDRANT_ASYNC_CLIENT
+    _QDRANT_ASYNC_CLIENTS[path] = async_client
+    return async_client
