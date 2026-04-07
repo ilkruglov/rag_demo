@@ -94,3 +94,12 @@ def test_delete_profile_resets_active_profile(monkeypatch, tmp_path):
 
     assert active_profile == "default"
     assert config.get_settings().active_profile == "default"
+
+
+def test_default_profile_label_is_sdek(monkeypatch, tmp_path):
+    _use_temp_runtime(monkeypatch, tmp_path)
+
+    catalog = config.get_profile_catalog()
+
+    assert catalog["default"]["label"] == "СДЭК"
+    assert catalog["default"]["description"] == "Базовый профиль FAQ СДЭК."

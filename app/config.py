@@ -21,6 +21,8 @@ DEFAULT_STOP_SEQUENCES = [
 ]
 
 DEFAULT_PROFILE_ID = "default"
+DEFAULT_PROFILE_LABEL = "СДЭК"
+DEFAULT_PROFILE_DESCRIPTION = "Базовый профиль FAQ СДЭК."
 
 PROMPT_PRESETS: dict[str, str] = {
     "universal": (
@@ -190,7 +192,7 @@ def normalize_profile_id(profile_id: str | None) -> str:
 
 def _default_profile_label(profile_id: str) -> str:
     if profile_id == DEFAULT_PROFILE_ID:
-        return "Default"
+        return DEFAULT_PROFILE_LABEL
     return profile_id.replace("-", " ").replace("_", " ").title()
 
 
@@ -295,7 +297,7 @@ def get_profile_catalog() -> dict[str, dict[str, Any]]:
     catalog[DEFAULT_PROFILE_ID] = {
         "profile_id": DEFAULT_PROFILE_ID,
         "label": _default_profile_label(DEFAULT_PROFILE_ID),
-        "description": "Текущий базовый профиль движка.",
+        "description": DEFAULT_PROFILE_DESCRIPTION,
         "is_active": base.active_profile == DEFAULT_PROFILE_ID,
         "qdrant_path": default_settings.qdrant_path,
         "storage_dir": default_settings.storage_dir,
